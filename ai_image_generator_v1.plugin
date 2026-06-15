@@ -1,0 +1,305 @@
+import requests  
+import urllib.parse  
+import random  
+import os  
+import uuid  
+import time  
+from io import BytesIO  
+from PIL import Image  
+  
+from base_plugin import BasePlugin, HookResult, HookStrategy  
+from android_utils import log, run_on_ui_thread  
+from client_utils import run_on_queue, send_message, get_send_messages_helper  
+from org.telegram.messenger import ApplicationLoader  
+from java.io import File  
+from ui.bulletin import BulletinHelper  
+from ui.settings import Header, Input
+from markdown_utils import parse_markdown
+  
+import threading  
+import traceback  
+
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+  
+def trans_en(txt):  
+    try:  
+        enc = urllib.parse.quote_plus(txt)  
+        url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=en&dt=t&q={enc}"  
+        r = requests.get(url, timeout=10)  
+        r.raise_for_status()  
+        res = r.json()  
+        return res[0][0][0] if res and res[0] and res[0][0] else None  
+    except Exception as e:  
+        log(f"trns fail: {e}")  
+        return None  
+  
+def make_img(txt):  
+    if len(txt) > 200:  
+        txt = txt[:200]  
+  
+    tag = f"#v{random.randint(1000,9999)}"  
+    q = urllib.parse.quote_plus(f"{txt} {tag}")  
+    link = f"https://image.pollinations.ai/prompt/{q}"  
+  
+    try:  
+        r = requests.get(link, stream=1, timeout=30)  
+        r.raise_for_status()  
+  
+        buf = BytesIO()  
+        for chunk in r.iter_content(8192): 
+            buf.write(chunk)  
+        buf.seek(0)  
+  
+        img = Image.open(buf)  
+        w,h = img.size  
+        new_h = int(h * .92)  
+        cropped = img.crop((0, 0, w, new_h))  
+  
+        out = BytesIO()  
+        cropped.save(out, format="JPEG")  
+        return out.getvalue(), None  
+    except Exception as e:  
+        log(f"img gen err: {e}")  
+        return None, str(e)  
+
+def ask_gemini(prompt, key, system_prompt):
+    try:
+        url = f"{GEMINI_URL}?key={key}"
+        data = {
+            "contents": [{
+                "role": "user",
+                "parts": [{"text": f"{system_prompt}\n\n{prompt}"}]
+            }]
+        }
+        
+        log(f"[AIGen] asking gemini: '{prompt[:50]}...'")
+        resp = requests.post(url, json=data, timeout=30)
+        resp.raise_for_status()
+        result = resp.json()
+        enhanced = result.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "").strip()
+        
+        log(f"[AIGen] got back: {enhanced[:100]}...")
+        return enhanced, None
+        
+    except requests.exceptions.Timeout:
+        return None, "gemini timeout"
+    except requests.exceptions.RequestException as e:
+        return None, f"gemini error: {e}"
+    except Exception as e:
+        return None, f"processing error: {e}"
+  
+class AIAIPlugin(BasePlugin):  
+    def __init__(self):  
+        super().__init__()  
+        self.temp_dir = None  
+  
+    def on_plugin_load(self):  
+        self.add_on_send_message_hook()  
+        self.temp_dir = self.setup_temp()  
+        if self.temp_dir:  
+            log("[AIGen] ready")  
+        else:  
+            log("[AIGen] no temp dir")  
+
+    def create_settings(self):
+        return [
+            Header(text="AI Image Generator Settings"),
+            Input(
+                key="gemini_api_key",
+                text="Gemini API Key",
+                default="",
+                subtext="your gemini key for .imgv2",
+                icon="key"
+            ),
+            Input(
+                key="ai_prompt",
+                text="Gemini Prompt",
+                default="""You are an elite AI prompt engineer specializing in hyper-realistic, cinematic, and artistically detailed image generation.  
+Your task is to write an extremely detailed, vivid, high-resolution text-to-image generation prompt based on the user's short description below.  
+Use all your creativity, technical knowledge, and visual storytelling skills to expand and enhance the idea into a visually stunning scene.  
+
+Make sure to:
+- Add environmental depth (e.g. landscape, background elements, weather conditions, atmospheric lighting)
+- Describe characters with precision (e.g. age, expression, hairstyle, clothing, accessories, pose, emotion)
+- Set the mood using light sources (natural or artificial), shadows, reflections, time of day, and contrast
+- Define a camera angle and focal length (e.g. close-up, wide-angle, bird's eye, isometric)
+- Choose a strong art style (e.g. hyperrealism, oil painting, cinematic still, dark fantasy, anime)
+- Integrate color theory (e.g. dominant tones, highlights, saturation)
+- Include high-resolution rendering specs (e.g. 8k, ultra-sharp focus, photorealistic texture, volumetric light)
+
+Important:
+Write only the final prompt that the image generator would use — no explanations or extra commentary.  
+Keep the output long and complex. Add maximum richness and visual storytelling value to even the smallest ideas.  
+If the user gave a very basic idea, expand it as much as possible.
+
+User input:
+
+""",
+                subtext="what to tell gemini",
+                icon="msg_photo_text_regular"
+            )
+        ]
+  
+    def setup_temp(self):  
+        try:  
+            base = ApplicationLoader.getFilesDirFixed()  
+            if not base: return None  
+            temp_path = File(base, "ai_generated_images")  
+            if not temp_path.exists() and not temp_path.mkdirs(): 
+                return None  
+            return temp_path  
+        except Exception as e:  
+            log(f"[AIGen] temp setup failed: {e}")  
+            return None  
+  
+    def cleanup_file(self, path, delay=30):  
+        def cleanup():  
+            try:  
+                time.sleep(delay)  
+                if os.path.exists(path): 
+                    os.remove(path)  
+            except Exception as e:  
+                log(f"cleanup failed: {e}")  
+        threading.Thread(target=cleanup, daemon=1).start()  
+  
+    def on_send_message_hook(self, account, params) -> HookStrategy:  
+        if not hasattr(params, 'message') or not isinstance(params.message, str):  
+            return HookResult()  
+  
+        msg = params.message.strip()
+        
+        if msg.lower().startswith(".img "):  
+            prompt = msg[5:].strip()  
+            if not prompt:  
+                params.message = "Usage: .img [your image prompt]"  
+                return HookResult(strategy=HookStrategy.MODIFY, params=params)  
+  
+            run_on_ui_thread(lambda: BulletinHelper.show_info("generating..."))  
+            run_on_queue(lambda: self.do_v1_gen(prompt, params.peer))  
+            return HookResult(strategy=HookStrategy.CANCEL)  
+        
+        elif msg.lower().startswith(".imgv2 "):  
+            prompt = msg[7:].strip()  
+            if not prompt:  
+                params.message = "Usage: .imgv2 [your image prompt]"  
+                return HookResult(strategy=HookStrategy.MODIFY, params=params)  
+  
+            run_on_ui_thread(lambda: BulletinHelper.show_info("enhancing with gemini..."))  
+            run_on_queue(lambda: self.do_v2_gen(prompt, params.peer))  
+            return HookResult(strategy=HookStrategy.CANCEL)  
+  
+        return HookResult()  
+  
+    def do_v1_gen(self, prompt, peer):
+        img_data, error = make_img(trans_en(prompt) or prompt)
+        self.send_result(img_data, error, peer)
+        
+    def do_v2_gen(self, prompt, peer):
+        key = self.get_setting("gemini_api_key", "").strip()
+        sys_prompt = self.get_setting("ai_prompt", "").strip()
+        
+        if not key:
+            def show_err():
+                msg = "*❌ need gemini key in settings*"
+                parsed = parse_markdown(msg)
+                params = {
+                    "message": parsed.text,
+                    "peer": peer,
+                    "entities": [x.to_tlrpc_object() for x in parsed.entities]
+                }
+                send_message(params)
+            run_on_ui_thread(show_err)
+            return
+            
+        if not sys_prompt:
+            sys_prompt = """You are an elite AI prompt engineer specializing in hyper-realistic, cinematic, and artistically detailed image generation.  
+Your task is to write an extremely detailed, vivid, high-resolution text-to-image generation prompt based on the user's short description below.  
+Use all your creativity, technical knowledge, and visual storytelling skills to expand and enhance the idea into a visually stunning scene.  
+
+Make sure to:
+- Add environmental depth (e.g. landscape, background elements, weather conditions, atmospheric lighting)
+- Describe characters with precision (e.g. age, expression, hairstyle, clothing, accessories, pose, emotion)
+- Set the mood using light sources (natural or artificial), shadows, reflections, time of day, and contrast
+- Define a camera angle and focal length (e.g. close-up, wide-angle, bird's eye, isometric)
+- Choose a strong art style (e.g. hyperrealism, oil painting, cinematic still, dark fantasy, anime)
+- Integrate color theory (e.g. dominant tones, highlights, saturation)
+- Include high-resolution rendering specs (e.g. 8k, ultra-sharp focus, photorealistic texture, volumetric light)
+
+Important:
+Write only the final prompt that the image generator would use — no explanations or extra commentary.  
+Keep the output long and complex. Add maximum richness and visual storytelling value to even the smallest ideas.  
+If the user gave a very basic idea, expand it as much as possible.
+
+User input:
+
+"""
+        
+        enhanced, gemini_err = ask_gemini(prompt, key, sys_prompt)
+        
+        if gemini_err:
+            def show_gemini_err():
+                msg = f"*❌ gemini failed:* `{gemini_err}`"
+                parsed = parse_markdown(msg)
+                params = {
+                    "message": parsed.text,
+                    "peer": peer,
+                    "entities": [x.to_tlrpc_object() for x in parsed.entities]
+                }
+                send_message(params)
+            run_on_ui_thread(show_gemini_err)
+            return
+        
+        run_on_ui_thread(lambda: BulletinHelper.show_info("making image..."))
+        img_data, error = make_img(enhanced)
+        self.send_result(img_data, error, peer, enhanced)
+        
+    def send_result(self, img_data, error, peer, enhanced_prompt=None):
+        def finish():  
+            if img_data:  
+                try:  
+                    file_path = None  
+                    if self.temp_dir:  
+                        filename = f"ai_image_{uuid.uuid4()}.jpg"  
+                        temp_file = File(self.temp_dir, filename)  
+                        file_path = temp_file.getAbsolutePath()  
+  
+                        with open(file_path, 'wb') as f: 
+                            f.write(img_data)  
+  
+                        helper = get_send_messages_helper()  
+                        photo_data = helper.generatePhotoSizes(file_path, None)  
+  
+                        if photo_data:  
+                            send_message({  
+                                "peer": peer,  
+                                "photo": photo_data,  
+                                "path": file_path,  
+                                "message": None  
+                            })  
+                            
+                            if enhanced_prompt:
+                                preview = enhanced_prompt[:100] + "..." if len(enhanced_prompt) > 100 else enhanced_prompt
+                                BulletinHelper.show_info(f"enhanced: {preview}")
+                            else:
+                                BulletinHelper.show_success("done!")  
+                            
+                            self.cleanup_file(file_path)  
+                        else:  
+                            BulletinHelper.show_error("send failed")  
+                            if file_path: os.remove(file_path)  
+                    else:  
+                        BulletinHelper.show_error("no temp dir")  
+                except Exception as e:  
+                    log(f"[AIGen] send error: {e}\n{traceback.format_exc()}")  
+                    BulletinHelper.show_error(f"error: {str(e)}")  
+            else:  
+                BulletinHelper.show_error(error or "unknown error")  
+        run_on_ui_thread(finish)  
+  
+__id__ = "ai_image_generator"  
+__name__ = "AI Image Generator"  
+__description__ = "Generate images from text using AI. Use: .img [prompt] or .imgv2 [prompt] (enhanced with Gemini)"  
+__author__ = "@DRR_R2"  
+__version__ = "2.0.0"  
+__min_version__ = "11.12.0"  
+__icon__ = "PersikEmojis/10"
